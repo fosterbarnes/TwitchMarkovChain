@@ -1,4 +1,3 @@
-
 from typing import List, Tuple
 
 from TwitchWebsocket import Message, TwitchWebsocket
@@ -80,26 +79,29 @@ class MarkovChain:
 
     def message_handler(self, m: Message):
         try:
+            # Check if the message type indicates a successful channel join
             if m.type == "366":
                 logger.info(f"Successfully joined channel: #{m.channel}")
-                # Get the list of mods used for modifying the blacklist
+                # Request the list of moderators for modifying the blacklist
                 logger.info("Fetching mod list...")
                 self.ws.send_message("/mods")
 
+            # Handle NOTICE messages, which may contain moderator information
             elif m.type == "NOTICE":
-                # Check whether the NOTICE is a response to our /mods request
                 if m.message.startswith("The moderators of this channel are:"):
+                    # Extract the list of moderators from the message
                     string_list = m.message.replace("The moderators of this channel are:", "").strip()
                     self.mod_list = [m.channel] + string_list.split(", ")
                     logger.info(f"Fetched mod list. Found {len(self.mod_list) - 1} mods.")
                 elif m.message == "There are no moderators of this channel.":
                     self.mod_list = [m.channel]
                     logger.info(f"Fetched mod list. Found no mods.")
-                # If it is not, log this NOTICE
                 else:
                     logger.info(m.message)
 
+            # Handle user messages (PRIVMSG and WHISPER)
             elif m.type in ("PRIVMSG", "WHISPER"):
+                # Check if the message is a command to enable the generate feature
                 if m.message.startswith("!enable") and self.check_if_permissions(m):
                     if self._enabled:
                         self.ws.send_whisper(m.user, "The generate command is already enabled.")
@@ -108,6 +110,7 @@ class MarkovChain:
                         self._enabled = True
                         logger.info("Users can now use generate command again.")
 
+                # Check if the message is a command to disable the generate feature
                 elif m.message.startswith("!disable") and self.check_if_permissions(m):
                     if self._enabled:
                         self.ws.send_whisper(m.user, "Users can now no longer use generate command.")
@@ -116,189 +119,197 @@ class MarkovChain:
                     else:
                         self.ws.send_whisper(m.user, "The generate command is already disabled.")
 
+                # Check if the message is a command to set the cooldown
                 elif m.message.startswith(("!setcooldown", "!setcd")) and self.check_if_permissions(m):
                     split_message = m.message.split(" ")
                     if len(split_message) == 2:
                         try:
-                            cooldown = int(split_message[1])
+                            cooldown = int(split_message[1])  # Convert the cooldown value to an integer
                         except ValueError:
                             self.ws.send_whisper(m.user, f"The parameter must be an integer amount, eg: !setcd 30")
                             return
-                        self.cooldown = cooldown
-                        Settings.update_cooldown(cooldown)
-                        self.ws.send_whisper(m.user, f"The !generate cooldown has been set to {cooldown} seconds.")
-                    else:
-                        self.ws.send_whisper(m.user, f"Please add exactly 1 integer parameter, eg: !setcd 30.")
-
-            if m.type == "PRIVMSG":
-
-                # Ignore bot messages
-                if m.user.lower() in self.denied_users:
-                    return
-                
-                if self.check_if_generate(m.message):
-                    if not self.enable_generate_command and not self.check_if_permissions(m):
-                        return
-
-                    if not self._enabled:
-                        if not self.db.check_whisper_ignore(m.user):
-                            self.send_whisper(m.user, "The !generate has been turned off. !nopm to stop me from whispering you.")
-                        return
-
-                    cur_time = time.time()
-                    if self.prev_message_t + self.cooldown < cur_time or self.check_if_permissions(m):
-                        if self.check_filter(m.message):
-                            sentence = "You can't make me say that, you madman!"
-                        else:
-                            params = tokenize(m.message)[2:] if self.allow_generate_params else None
-                            # Generate an actual sentence
-                            sentence, success = self.generate(params)
-                            if success:
-                                # Reset cooldown if a message was actually generated
-                                self.prev_message_t = time.time()
-                        logger.info(sentence)
-                        self.ws.send_message(sentence)
-                    else:
-                        if not self.db.check_whisper_ignore(m.user):
-                            self.send_whisper(m.user, f"Cooldown hit: {self.prev_message_t + self.cooldown - cur_time:0.2f} out of {self.cooldown:.0f}s remaining. !nopm to stop these cooldown pm's.")
-                        logger.info(f"Cooldown hit with {self.prev_message_t + self.cooldown - cur_time:0.2f}s remaining.")
-                    return
-                
-                # Send help message when requested.
-                elif m.message.startswith(("!ghelp", "!genhelp", "!generatehelp")):
-                    self.send_help_message()
-
-                # Ignore the message if it is deemed a command
-                elif self.check_if_other_command(m.message):
-                    return
-                
-                # Ignore the message if it contains a link.
-                elif self.check_link(m.message):
-                    return
-
-                if "emotes" in m.tags:
-                    # If the list of emotes contains "emotesv2_", then the message contains a bit emote, 
-                    # and we choose not to learn from those messages.
-                    if "emotesv2_" in m.tags["emotes"]:
-                        return
-
-                    # Replace modified emotes with normal versions, 
-                    # as the bot will never have the modified emotes unlocked at the time.
-                    for modifier in self.extract_modifiers(m.tags["emotes"]):
-                        m.message = m.message.replace(modifier, "")
-
-                # Ignore the message if any word in the sentence is on the ban filter
-                if self.check_filter(m.message):
-                    logger.warning(f"Sentence contained blacklisted word or phrase:\"{m.message}\"")
-                    return
-                
+                    self.cooldown = cooldown
+                    Settings.update_cooldown(cooldown)  # Update the cooldown in settings
+                    self.ws.send_whisper(m.user, f"The !generate cooldown has been set to {cooldown} seconds.")
                 else:
-                    # Try to split up sentences. Requires nltk's 'punkt' resource
-                    try:
-                        sentences = sent_tokenize(m.message.strip())
-                    # If 'punkt' is not downloaded, then download it, and retry
-                    except LookupError:
-                        logger.debug("Downloading required punkt resource...")
-                        import nltk
-                        nltk.download('punkt')
-                        logger.debug("Downloaded required punkt resource.")
-                        sentences = sent_tokenize(m.message.strip())
+                    self.ws.send_whisper(m.user, f"Please add exactly 1 integer parameter, eg: !setcd 30.")
 
-                    for sentence in sentences:
-                        # Get all seperate words
-                        words = tokenize(sentence)
-                        # Double spaces will lead to invalid rules. We remove empty words here
-                        if "" in words:
-                            words = [word for word in words if word]
+                # Process regular chat messages
+                if m.type == "PRIVMSG":
+                    # Ignore messages from users in the denied users list
+                    if m.user.lower() in self.denied_users:
+                        return
+                    
+                    # Check if the message is a generate command
+                    if self.check_if_generate(m.message):
+                        # If generate command is disabled and user lacks permissions, ignore the message
+                        if not self.enable_generate_command and not self.check_if_permissions(m):
+                            return
+
+                        # If the generate feature is disabled, send a whisper to the user
+                        if not self._enabled:
+                            if not self.db.check_whisper_ignore(m.user):
+                                self.send_whisper(m.user, "The !generate has been turned off. !nopm to stop me from whispering you.")
+                            return
+
+                        cur_time = time.time()  # Get the current time
+                        # Check if the cooldown period has passed
+                        if self.prev_message_t + self.cooldown < cur_time or self.check_if_permissions(m):
+                            # Check if the message passes the filter
+                            if self.check_filter(m.message):
+                                sentence = "You can't make me say that, you madman!"
+                            else:
+                                # Tokenize the message to extract parameters for generation
+                                params = tokenize(m.message)[2:] if self.allow_generate_params else None
+                                # Generate a sentence based on the parameters
+                                sentence, success = self.generate(params)
+                                if success:
+                                    # Reset the previous message time if a message was generated
+                                    self.prev_message_t = time.time()
+                            logger.info(sentence)  # Log the generated sentence
+                            self.ws.send_message(sentence)  # Send the generated sentence to the chat
+                        else:
+                            # If cooldown is active, inform the user
+                            if not self.db.check_whisper_ignore(m.user):
+                                self.send_whisper(m.user, f"Cooldown hit: {self.prev_message_t + self.cooldown - cur_time:0.2f} out of {self.cooldown:.0f}s remaining. !nopm to stop these cooldown pm's.")
+                            logger.info(f"Cooldown hit with {self.prev_message_t + self.cooldown - cur_time:0.2f}s remaining.")
+                        return
+                    
+                    # Handle help command
+                    elif m.message.startswith(("!ghelp", "!genhelp", "!generatehelp")):
+                        self.send_help_message()
+
+                    # Ignore the message if it is deemed a command
+                    elif self.check_if_other_command(m.message):
+                        return
+                    
+                    # Ignore the message if it contains a link
+                    elif self.check_link(m.message):
+                        return
+
+                    # Process emotes in the message
+                    if "emotes" in m.tags:
+                        # Ignore messages containing bit emotes
+                        if "emotesv2_" in m.tags["emotes"]:
+                            return
+
+                        # Replace modified emotes with normal versions
+                        for modifier in self.extract_modifiers(m.tags["emotes"]):
+                            m.message = m.message.replace(modifier, "")
+
+                    # Check if the message contains any blacklisted words
+                    if self.check_filter(m.message):
+                        logger.warning(f"Sentence contained blacklisted word or phrase:\"{m.message}\"")
+                        return
+                    
+                    else:
+                        # Split the message into sentences using NLTK's tokenizer
+                        try:
+                            sentences = sent_tokenize(m.message.strip())
+                            logger.info(f"Successfully split message into sentences: {sentences}")
+                        except LookupError:
+                            logger.debug("Downloading required punkt resource...")
+                            import nltk
+                            nltk.download('punkt')  # Download the punkt tokenizer resource
+                            logger.debug("Downloaded required punkt resource.")
+                            sentences = sent_tokenize(m.message.strip())
+                            logger.info(f"Successfully split message into sentences after downloading resource: {sentences}")
+
+                        # Process each sentence
+                        for sentence in sentences:
+                            logger.info(f"Processing sentence: {sentence}")  # Log the current sentence being processed
                             
-                        # If the sentence is too short, ignore it and move on to the next.
-                        if len(words) <= self.key_length:
-                            continue
-                        
-                        # Add a new starting point for a sentence to the <START>
-                        #self.db.add_rule(["<START>"] + [words[x] for x in range(self.key_length)])
-                        self.db.add_start_queue([words[x] for x in range(self.key_length)])
-                        
-                        # Create Key variable which will be used as a key in the Dictionary for the grammar
-                        key = list()
-                        for word in words:
-                            # Set up key for first use
-                            if len(key) < self.key_length:
-                                key.append(word)
+                            # Tokenize the sentence into words
+                            words = tokenize(sentence)
+                            logger.info(f"Tokenized sentence into words: {words}")  # Log the tokenized words
+                            
+                            # Remove empty words caused by double spaces
+                            if "" in words:
+                                words = [word for word in words if word]
+                                logger.info(f"Removed empty words, resulting in: {words}")  # Log the cleaned words
+
+                            # Ignore sentences that are too short
+                            if len(words) <= self.key_length:
+                                logger.info(f"Ignored sentence due to short length: {sentence}")
                                 continue
                             
-                            self.db.add_rule_queue(key + [word])
+                            # Add a new starting point for a sentence to the database
+                            self.db.add_start_queue([words[x] for x in range(self.key_length)])
+                            logger.info(f"Added starting point to database: {[words[x] for x in range(self.key_length)]}")
+
+                            # Create a key variable for the grammar dictionary
+                            key = list()
+                            for word in words:
+                                # Set up key for first use
+                                if len(key) < self.key_length:
+                                    key.append(word)
+                                    continue
+                                
+                                # Add the current key and word to the database
+                                self.db.add_rule_queue(key + [word])
+                                logger.info(f"Added rule to database: {key + [word]}")  # Log the rule added
+                                
+                                # Update the key for the next word
+                                key.pop(0)
+                                key.append(word)
                             
-                            # Remove the first word, and add the current word,
-                            # so that the key is correct for the next word.
-                            key.pop(0)
-                            key.append(word)
-                        # Add <END> at the end of the sentence
-                        self.db.add_rule_queue(key + ["<END>"])
-                    
-            elif m.type == "WHISPER":
-                # Allow people to whisper the bot to disable or enable whispers.
-                if m.message == "!nopm":
-                    logger.debug(f"Adding {m.user} to Do Not Whisper.")
-                    self.db.add_whisper_ignore(m.user)
-                    self.ws.send_whisper(m.user, "You will no longer be sent whispers. Type !yespm to reenable. ")
+                            # Add <END> at the end of the sentence
+                            self.db.add_rule_queue(key + ["<END>"])
+                            logger.info(f"Added end marker to database for sentence: {key + ['<END>']}")
+                        
+                elif m.type == "WHISPER":
+                    # Allow users to manage their whisper settings
+                    if m.message == "!nopm":
+                        logger.debug(f"Adding {m.user} to Do Not Whisper.")
+                        self.db.add_whisper_ignore(m.user)
+                        self.ws.send_whisper(m.user, "You will no longer be sent whispers. Type !yespm to reenable. ")
 
-                elif m.message == "!yespm":
-                    logger.debug(f"Removing {m.user} from Do Not Whisper.")
-                    self.db.remove_whisper_ignore(m.user)
-                    self.ws.send_whisper(m.user, "You will again be sent whispers. Type !nopm to disable again. ")
+                    elif m.message == "!yespm":
+                        logger.debug(f"Removing {m.user} from Do Not Whisper.")
+                        self.db.remove_whisper_ignore(m.user)
+                        self.ws.send_whisper(m.user, "You will again be sent whispers. Type !nopm to disable again. ")
 
-                # Note that I add my own username to this list to allow me to manage the 
-                # blacklist in channels of my bot in channels I am not modded in.
-                # I may modify this and add a "allowed users" field in the settings file.
-                elif m.user.lower() in self.mod_list + ["cubiedev"] + self.allowed_users:
-                    # Adding to the blacklist
-                    if self.check_if_our_command(m.message, "!blacklist"):
-                        if len(m.message.split()) == 2:
-                            # TODO: Remove newly blacklisted word from the Database
-                            word = m.message.split()[1].lower()
-                            self.blacklist.append(word)
-                            logger.info(f"Added `{word}` to Blacklist.")
-                            self.write_blacklist(self.blacklist)
-                            self.ws.send_whisper(m.user, "Added word to Blacklist.")
-                        else:
-                            self.ws.send_whisper(m.user, "Expected Format: `!blacklist word` to add `word` to the blacklist")
-
-                    # Removing from the blacklist
-                    elif self.check_if_our_command(m.message, "!whitelist"):
-                        if len(m.message.split()) == 2:
-                            word = m.message.split()[1].lower()
-                            try:
-                                self.blacklist.remove(word)
-                                logger.info(f"Removed `{word}` from Blacklist.")
+                    # Allow moderators and allowed users to manage the blacklist
+                    elif m.user.lower() in self.mod_list + ["cubiedev"] + self.allowed_users:
+                        # Adding to the blacklist
+                        if self.check_if_our_command(m.message, "!blacklist"):
+                            if len(m.message.split()) == 2:
+                                word = m.message.split()[1].lower()
+                                self.blacklist.append(word)
+                                logger.info(f"Added `{word}` to Blacklist.")
                                 self.write_blacklist(self.blacklist)
-                                self.ws.send_whisper(m.user, "Removed word from Blacklist.")
-                            except ValueError:
-                                self.ws.send_whisper(m.user, "Word was already not in the blacklist.")
-                        else:
-                            self.ws.send_whisper(m.user, "Expected Format: `!whitelist word` to remove `word` from the blacklist.")
-                    
-                    # Checking whether a word is in the blacklist
-                    elif self.check_if_our_command(m.message, "!check"):
-                        if len(m.message.split()) == 2:
-                            word = m.message.split()[1].lower()
-                            if word in self.blacklist:
-                                self.ws.send_whisper(m.user, "This word is in the Blacklist.")
+                                self.ws.send_whisper(m.user, "Added word to Blacklist.")
                             else:
-                                self.ws.send_whisper(m.user, "This word is not in the Blacklist.")
-                        else:
-                            self.ws.send_whisper(m.user, "Expected Format: `!check word` to check whether `word` is on the blacklist.")
+                                self.ws.send_whisper(m.user, "Expected Format: `!blacklist word` to add `word` to the blacklist")
 
-            elif m.type == "CLEARMSG":
-                # If a message is deleted, its contents will be unlearned
-                # or rather, the "occurances" attribute of each combinations of words in the sentence
-                # is reduced by 5, and deleted if the occurances is now less than 1. 
-                self.db.unlearn(m.message)
-                
-                # TODO: Think of some efficient way to check whether it was our message that got deleted.
-                # If the bot's message was deleted, log this as an error
-                #if m.user.lower() == self.nick.lower():
-                #    logger.error(f"This bot message was deleted: \"{m.message}\"")
+                        # Removing from the blacklist
+                        elif self.check_if_our_command(m.message, "!whitelist"):
+                            if len(m.message.split()) == 2:
+                                word = m.message.split()[1].lower()
+                                try:
+                                    self.blacklist.remove(word)
+                                    logger.info(f"Removed `{word}` from Blacklist.")
+                                    self.write_blacklist(self.blacklist)
+                                    self.ws.send_whisper(m.user, "Removed word from Blacklist.")
+                                except ValueError:
+                                    self.ws.send_whisper(m.user, "Word was already not in the blacklist.")
+                            else:
+                                self.ws.send_whisper(m.user, "Expected Format: `!whitelist word` to remove `word` from the blacklist.")
+                        
+                        # Checking whether a word is in the blacklist
+                        elif self.check_if_our_command(m.message, "!check"):
+                            if len(m.message.split()) == 2:
+                                word = m.message.split()[1].lower()
+                                if word in self.blacklist:
+                                    self.ws.send_whisper(m.user, "This word is in the Blacklist.")
+                                else:
+                                    self.ws.send_whisper(m.user, "This word is not in the Blacklist.")
+                            else:
+                                self.ws.send_whisper(m.user, "Expected Format: `!check word` to check whether `word` is on the blacklist.")
+
+                elif m.type == "CLEARMSG":
+                    # If a message is deleted, its contents will be unlearned
+                    self.db.unlearn(m.message)
 
         except Exception as e:
             logger.exception(e)
