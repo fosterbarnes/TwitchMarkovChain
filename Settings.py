@@ -21,9 +21,14 @@ class SettingsData(TypedDict):
     MinSentenceWordAmount: int
     HelpMessageTimer: int
     AutomaticGenerationTimer: int
+    RandomizedGenerationTimerEnabled: bool
+    RandomizedGenerationTimerMin: int
+    RandomizedGenerationTimerMax: int
     WhisperCooldown: bool
     EnableGenerateCommand: bool
     SentenceSeparator: str
+    AllowGenerateParams: bool
+    GenerateCommands: List[str]
 
 class Settings:
     """ Loads data from settings.json into the bot """
@@ -40,10 +45,13 @@ class Settings:
         "AllowedUsers": [],
         "Cooldown": 20,
         "KeyLength": 2,
-        "MaxSentenceWordAmount": 25,
+        "MaxSentenceWordAmount": 40,
         "MinSentenceWordAmount": -1,
         "HelpMessageTimer": 60 * 60 * 5, # 18000 seconds, 5 hours
         "AutomaticGenerationTimer": -1,
+        "RandomizedGenerationTimerEnabled": False,
+        "RandomizedGenerationTimerMin": 30,
+        "RandomizedGenerationTimerMax": 100,
         "WhisperCooldown": True,
         "EnableGenerateCommand": True,
         "SentenceSeparator": " - ",

@@ -1,8 +1,24 @@
+import os
+import logging
+import datetime
+import threading
+import sys
+
+# Set up logging to a file in the same directory as this script
+log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'markov_debug.log')
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename=log_path,
+    filemode='w',  # Overwrite each run; use 'a' to append
+    format='%(asctime)s %(levelname)s: %(message)s'
+)
+
 from typing import List, Tuple
 
 from TwitchWebsocket import Message, TwitchWebsocket
 from nltk.tokenize import sent_tokenize
-import socket, time, logging, re, string
+import socket, time, re, string
+import random
 
 from Settings import Settings, SettingsData
 from Database import Database
@@ -14,6 +30,18 @@ Log(__file__)
 
 logger = logging.getLogger(__name__)
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+def contains_private_unicode(key):
+    if not key:
+        return False
+    for word in key:
+        if any(0xE0000 <= ord(char) <= 0xE007F for char in word):
+            return True
+    return False
+
 class MarkovChain:
     def __init__(self):
         self.prev_message_t = 0
@@ -23,6 +51,9 @@ class MarkovChain:
         # List of moderators used in blacklist modification, includes broadcaster
         self.mod_list = []
         self.set_blacklist()
+        self.last_trigger_time = 0
+        self._randomized_timer_thread = None
+        self._randomized_timer_stop = threading.Event()
 
         # Fill previously initialised variables with data from the settings.txt file
         Settings(self)
@@ -35,12 +66,20 @@ class MarkovChain:
             t = LoopingTimer(self.help_message_timer, self.send_help_message)
             t.start()
         
-        # Set up daemon Timer to send automatic generation messages
-        if self.automatic_generation_timer > 0:
-            if self.automatic_generation_timer < 30:
-                raise ValueError("Value for \"AutomaticGenerationMessage\" in must be at least 30 seconds, or a negative number for no automatic generations.")
+        # Set up daemon Timer to send automatic or randomized generation messages
+        if getattr(self, 'randomized_generation_timer_enabled', False):
+            self._start_randomized_generation_timer()
+        elif self.automatic_generation_timer > 0:
+            if self.automatic_generation_timer < 5:
+                raise ValueError("Value for \"AutomaticGenerationMessage\" in must be at least 5 seconds, or a negative number for no automatic generations.")
             t = LoopingTimer(self.automatic_generation_timer, self.send_automatic_generation_message)
             t.start()
+
+        # Set up daemon Timer to check for manual triggers from GUI
+        t = LoopingTimer(1, lambda: self.check_for_manual_trigger())
+        t.start()
+        # Start TCP trigger server in a background thread
+        threading.Thread(target=self.tcp_trigger_server, daemon=True).start()
 
         self.ws = TwitchWebsocket(host=self.host, 
                                   port=self.port,
@@ -50,14 +89,12 @@ class MarkovChain:
                                   callback=self.message_handler,
                                   capability=["commands", "tags"],
                                   live=True)
+        timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+        print(f"{timestamp} [TwitchWebsocket.TwitchWebsocket] [INFO    ] - Attempting to initialize websocket connection.", flush=True)
         self.ws.start_bot()
 
     def set_settings(self, settings: SettingsData):
-        """Fill class instance attributes based on the settings file.
-
-        Args:
-            settings (SettingsData): The settings dict with information from the settings file.
-        """
+        """Fill class instance attributes based on the settings file."""
         self.host = settings["Host"]
         self.port = settings["Port"]
         self.chan = settings["Channel"]
@@ -65,7 +102,7 @@ class MarkovChain:
         self.auth = settings["Authentication"]
         self.denied_users = [user.lower() for user in settings["DeniedUsers"]] + [self.nick.lower()]
         self.allowed_users = [user.lower() for user in settings["AllowedUsers"]]
-        self.cooldown = settings["Cooldown"]
+        self.cooldown = int(settings["Cooldown"])
         self.key_length = settings["KeyLength"]
         self.max_sentence_length = settings["MaxSentenceWordAmount"]
         self.min_sentence_length = settings["MinSentenceWordAmount"]
@@ -76,14 +113,45 @@ class MarkovChain:
         self.sent_separator = settings["SentenceSeparator"]
         self.allow_generate_params = settings["AllowGenerateParams"]
         self.generate_commands = tuple(settings["GenerateCommands"])
+        self.cooldown_warned = False
+        # New randomized timer fields
+        self.randomized_generation_timer_enabled = settings.get("RandomizedGenerationTimerEnabled", False)
+        self.randomized_generation_timer_min = settings.get("RandomizedGenerationTimerMin", 30)
+        self.randomized_generation_timer_max = settings.get("RandomizedGenerationTimerMax", 100)
 
-    def message_handler(self, m: Message):
+    def _start_randomized_generation_timer(self):
+        if self._randomized_timer_thread and self._randomized_timer_thread.is_alive():
+            return  # Already running
+        self._randomized_timer_stop.clear()
+        self._randomized_timer_thread = threading.Thread(target=self._randomized_timer_loop, daemon=True)
+        self._randomized_timer_thread.start()
+
+    def _randomized_timer_loop(self):
+        while not self._randomized_timer_stop.is_set() and getattr(self, 'randomized_generation_timer_enabled', False):
+            min_val = max(5, self.randomized_generation_timer_min)
+            wait_time = random.randint(min_val, self.randomized_generation_timer_max)
+            logger.info(f"[RandomizedTimer] Next message in {wait_time} seconds.")
+            timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]")
+            print(f"{timestamp}: (RandomizedTimer) Selected wait time: {wait_time} seconds.", flush=True)
+            for _ in range(wait_time):
+                if self._randomized_timer_stop.is_set() or not getattr(self, 'randomized_generation_timer_enabled', False):
+                    return
+                time.sleep(1)
+            self.send_randomized_generation_message()
+
+    def message_handler(self, m: Message, check_trigger=True):
         try:
+            if check_trigger:
+                self.check_for_manual_trigger()
+            
             # Check if the message type indicates a successful channel join
             if m.type == "366":
+                timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
                 logger.info(f"Successfully joined channel: #{m.channel}")
+                print(f"{timestamp} Successfully joined channel: #{m.channel}", flush=True)
                 # Request the list of moderators for modifying the blacklist
                 logger.info("Fetching mod list...")
+                print(f"{timestamp} Fetching mod list...", flush=True)
                 self.ws.send_message("/mods")
 
             # Handle NOTICE messages, which may contain moderator information
@@ -152,8 +220,8 @@ class MarkovChain:
                                 self.send_whisper(m.user, "The !generate has been turned off. !nopm to stop me from whispering you.")
                             return
 
-                        cur_time = time.time()  # Get the current time
-                        # Check if the cooldown period has passed
+                        cur_time = time.time()
+                        remaining = int(self.prev_message_t + self.cooldown - cur_time)
                         if self.prev_message_t + self.cooldown < cur_time or self.check_if_permissions(m):
                             # Check if the message passes the filter
                             if self.check_filter(m.message):
@@ -166,13 +234,23 @@ class MarkovChain:
                                 if success:
                                     # Reset the previous message time if a message was generated
                                     self.prev_message_t = time.time()
+                                    self.cooldown_warned = False  # Reset warning flag after successful generation
                             logger.info(sentence)  # Log the generated sentence
                             self.ws.send_message(sentence)  # Send the generated sentence to the chat
+                            timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+                            print(f"{timestamp} {sentence}", flush=True)  # Print with timecode for GUI
+                            logging.debug(f"[DEBUG] About to send message to Twitch: {repr(sentence)}")
+                            logging.debug(f"[DEBUG] Message sent successfully")
                         else:
+                            if not self.cooldown_warned:
+                                self.ws.send_message(f"Yap Bot's on cooldown for {max(1, remaining)} seconds")
+                                self.cooldown_warned = True
                             # If cooldown is active, inform the user
                             if not self.db.check_whisper_ignore(m.user):
                                 self.send_whisper(m.user, f"Cooldown hit: {self.prev_message_t + self.cooldown - cur_time:0.2f} out of {self.cooldown:.0f}s remaining. !nopm to stop these cooldown pm's.")
                             logger.info(f"Cooldown hit with {self.prev_message_t + self.cooldown - cur_time:0.2f}s remaining.")
+                            timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+                            print(f"{timestamp} Cooldown hit with {self.prev_message_t + self.cooldown - cur_time:0.2f}s remaining.", flush=True)
                         return
                     
                     # Handle help command
@@ -205,14 +283,14 @@ class MarkovChain:
                     else:
                         # Split the message into sentences using NLTK's tokenizer
                         try:
-                            sentences = sent_tokenize(m.message.strip())
+                            sentences = sent_tokenize(m.message.strip(), language="english")
                             logger.info(f"Successfully split message into sentences: {sentences}")
                         except LookupError:
                             logger.debug("Downloading required punkt resource...")
                             import nltk
                             nltk.download('punkt')  # Download the punkt tokenizer resource
                             logger.debug("Downloaded required punkt resource.")
-                            sentences = sent_tokenize(m.message.strip())
+                            sentences = sent_tokenize(m.message.strip(), language="english")
                             logger.info(f"Successfully split message into sentences after downloading resource: {sentences}")
 
                         # Process each sentence
@@ -313,6 +391,8 @@ class MarkovChain:
 
         except Exception as e:
             logger.exception(e)
+            timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+            print(f"{timestamp} Exception: {e}", flush=True)
 
     def generate(self, params: List[str] = None) -> "Tuple[str, bool]":
         """Given an input sentence, generate the remainder of the sentence using the learned data.
@@ -325,6 +405,13 @@ class MarkovChain:
                 whether the generation succeeded as the second value.
         """
         if params is None:
+            params = []
+
+        logging.debug(f"[DEBUG] generate called with params: {repr(params)}")
+
+        # If any input param contains private use unicode, ignore input and run as default
+        if any(contains_private_unicode([param]) for param in params):
+            logging.debug(f"[DEBUG] User input contains private unicode, running default generate. Params: {repr(params)}")
             params = []
 
         # List of sentences that will be generated. In some cases, multiple sentences will be generated,
@@ -341,29 +428,38 @@ class MarkovChain:
         # Note that self.key_length is fixed to 2 in this implementation
         if len(params) > 1:
             key = params[-self.key_length:]
-            # Copy the entire params for the sentence
+            logging.debug(f"[DEBUG] Multi-word params, key: {repr(key)}")
+            if contains_private_unicode(key):
+                logging.debug(f"[DEBUG] Fallback: multi-word params contain private unicode: {repr(key)} | params: {repr(params)}")
+                return f'I haven\'t extracted "{detokenize(key)}" from chat yet.', False
             sentences[0] = params.copy()
-
+            logging.debug(f"[DEBUG] Multi-word params, using key: {repr(key)}")
         elif len(params) == 1:
-            # First we try to find if this word was once used as the first word in a sentence:
             key = self.db.get_next_single_start(params[0])
-            if key == None:
-                # If this failed, we try to find the next word in the grammar as a whole
+            logging.debug(f"[DEBUG] get_next_single_start({params[0]}) returned: {repr(key)}")
+            if key is not None and contains_private_unicode(key):
+                logging.debug(f"[DEBUG] Fallback: get_next_single_start returned private unicode: {repr(key)} | params: {repr(params)}")
+                key = None
+            if key is None:
                 key = self.db.get_next_single_initial(0, params[0])
-                if key == None:
-                    # Return a message that this word hasn't been learned yet
-                    return f"I haven't extracted \"{params[0]}\" from chat yet.", False
-            # Copy this for the sentence
+                logging.debug(f"[DEBUG] get_next_single_initial(0, {params[0]}) returned: {repr(key)}")
+                if key is not None and contains_private_unicode(key):
+                    logging.debug(f"[DEBUG] Fallback: get_next_single_initial returned private unicode: {repr(key)} | params: {repr(params)}")
+                    key = None
+                if key is None:
+                    logging.debug(f"[DEBUG] Fallback: haven't extracted {params[0]} from chat yet. | params: {repr(params)}")
+                    return f'I haven\'t extracted "{params[0]}" from chat yet.', False
             sentences[0] = key.copy()
-
-        else: # if there are no params
-            # Get starting key
-            key = self.db.get_start()
-            if key:
-                # Copy this for the sentence
+            logging.debug(f"[DEBUG] Single-word param, using key: {repr(key)}")
+        else:
+            all_keys = [k for k in self.db.get_all_starts() if k and not contains_private_unicode(k)]
+            logging.debug(f"[DEBUG] All valid starting keys: {[repr(k) for k in all_keys]}")
+            if all_keys:
+                key = random.choice(all_keys)
+                logging.debug(f"[DEBUG] Chosen starting key: {repr(key)}")
                 sentences[0] = key.copy()
             else:
-                # If nothing's ever been said
+                logging.debug(f"[DEBUG] Fallback: not enough learned information. | params: {repr(params)}")
                 return "There is not enough learned information yet.", False
         
         # Counter to prevent infinite loops (i.e. constantly generating <END> while below the 
@@ -403,6 +499,7 @@ class MarkovChain:
         # Then the params did not result in an actual sentence
         # If so, restart without params
         if len(params) > 0 and params == sentences[0]:
+            logging.debug(f"[DEBUG] Fallback: params identical to generated sentence. Params: {repr(params)}, Sentence: {repr(sentences[0])}")
             return "I haven't learned what to do with \"" + detokenize(params[-self.key_length:]) + "\" yet.", False
 
         return self.sent_separator.join(detokenize(sentence) for sentence in sentences), True
@@ -488,6 +585,9 @@ class MarkovChain:
             sentence, success = self.generate()
             if success:
                 logger.info(sentence)
+                timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+                print(f"{timestamp} Message generated by automatic timer:", flush=True)
+                print(f"{timestamp} {sentence}", flush=True)
                 # Try to send a message. Just log a warning on fail
                 try:
                     self.ws.send_message(sentence)
@@ -495,6 +595,22 @@ class MarkovChain:
                     logger.warning(f"[OSError: {error}] upon sending automatic generation message. Ignoring.")
             else:
                 logger.info("Attempted to output automatic generation message, but there is not enough learned information yet.")
+
+    def send_randomized_generation_message(self):
+        """Send a randomized generation message to the connected chat, then schedule the next one."""
+        if self._enabled:
+            timestamp = datetime.datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]")
+            print(f"{timestamp}: (RandomizedTimer): Generating and sending message via randomized timer.", flush=True)
+            sentence, success = self.generate()
+            if success:
+                print(f"{timestamp}: {sentence}", flush=True)
+                logger.info(sentence)
+                try:
+                    self.ws.send_message(sentence)
+                except socket.OSError as error:
+                    logger.warning(f"[OSError: {error}] upon sending randomized generation message. Ignoring.")
+            else:
+                logger.info("Attempted to output randomized generation message, but there is not enough learned information yet.")
 
     def send_whisper(self, user: str, message: str) -> None:
         """Optionally send a whisper, only if "WhisperCooldown" is True.
@@ -576,6 +692,58 @@ class MarkovChain:
             bool: True if the message contains a link.
         """
         return self.link_regex.search(message)
+
+    def trigger_yap(self, user="ManualTrigger"):
+        from datetime import datetime
+        timestamp = datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+        print(f"{timestamp} Generate command triggered manually", flush=True)
+        # Use the first generate command from settings
+        command = self.generate_commands[0] if self.generate_commands else "!generate"
+        class MockMessage:
+            def __init__(self, user, message, channel, msg_type="PRIVMSG"):
+                self.user = user
+                self.message = message
+                self.type = msg_type
+                self.channel = channel  # Use the bot's channel
+        # Create a mock message for the trigger
+        mock_msg = MockMessage(user, command, self.chan)
+        # Process it through the message handler
+        self.message_handler(mock_msg, check_trigger=False)
+
+    def check_for_manual_trigger(self):
+        import time
+        import glob
+        from datetime import datetime
+        trigger_files = glob.glob("trigger_yap_*.txt")
+        for trigger_file in trigger_files:
+            now = time.time()
+            if now - self.last_trigger_time > 1.5:
+                try:
+                    os.remove(trigger_file)
+                    timestamp = datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+                    print(f"{timestamp} Generate command trigerred manually", flush=True)
+                    self.trigger_yap()
+                    self.last_trigger_time = now
+                except FileNotFoundError:
+                    pass
+
+    def tcp_trigger_server(self):
+        import socket
+        from datetime import datetime
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('127.0.0.1', 8765))
+        server.listen(5)
+        timestamp = datetime.now().strftime("[%m/%d/%Y - %H:%M:%S]:")
+        print(f"{timestamp} TCP server for manual triggers listening on 127.0.0.1:8765", flush=True)
+        while True:
+            conn, _ = server.accept()
+            try:
+                data = conn.recv(1024)
+                if data and b"YAP" in data:
+                    self.trigger_yap()
+            finally:
+                conn.close()
 
 if __name__ == "__main__":
     MarkovChain()

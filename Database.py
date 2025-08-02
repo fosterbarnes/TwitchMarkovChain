@@ -842,3 +842,16 @@ class Database:
                                    values=(word1, word2, word3, ))
 
         self.execute_commit()
+
+    def get_all_starts(self) -> list:
+        """Return all valid starting keys (pairs of words) from all MarkovStart tables."""
+        all_starts = []
+        for first_char in list(string.ascii_uppercase) + ["_"]:
+            data = self.execute(
+                f"SELECT word1, word2 FROM MarkovStart{first_char};",
+                fetch=True)
+            for row in data:
+                # Only add if both words are non-empty
+                if row[0] and row[1]:
+                    all_starts.append([row[0], row[1]])
+        return all_starts
